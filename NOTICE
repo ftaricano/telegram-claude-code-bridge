@@ -1,0 +1,13 @@
+Telegram Claude Code Bridge is derived from RichardAtCT/claude-code-telegram,
+originally authored by Richard Atkinson.
+
+This fork is maintained by Fernando Taricano and includes substantial changes
+for topic-scoped Telegram sessions, delivery durability, long-context handling,
+operator visibility, and maintainer workflows.
+
+The upstream project metadata declares MIT licensing in pyproject.toml and the
+README. This repository includes the MIT license text explicitly so downstream
+users can identify redistribution terms without relying on package metadata.
+
+When redistributing substantial portions of this project, preserve this notice
+and the LICENSE file.

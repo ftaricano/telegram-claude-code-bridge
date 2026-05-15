@@ -1,0 +1,1236 @@
+"""Claude Code Python SDK integration."""
+
+import asyncio
+import os
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Mapping, Optional
+
+import structlog
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    ClaudeSDKError,
+    CLIConnectionError,
+    CLIJSONDecodeError,
+    CLINotFoundError,
+    HookMatcher,
+    Message,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ProcessError,
+    ResultMessage,
+    TextBlock,
+    ThinkingBlock,
+    ToolPermissionContext,
+    ToolUseBlock,
+    UserMessage,
+)
+from claude_agent_sdk._errors import MessageParseError
+from claude_agent_sdk._internal.message_parser import parse_message
+from claude_agent_sdk.types import StreamEvent
+
+from ..config.settings import Settings
+from ..security.validators import SecurityValidator
+from .ask_user_question import (
+    ASK_USER_QUESTION_TIMEOUT_SECONDS,
+    DEFAULT_ASK_USER_QUESTION_REGISTRY,
+    AskUserQuestionRegistry,
+)
+from .exceptions import (
+    ClaudeMCPError,
+    ClaudeParsingError,
+    ClaudeProcessError,
+    ClaudeTimeoutError,
+)
+from .goal_manager import GoalManager
+from .monitor import _is_claude_internal_path, check_bash_directory_boundary
+
+logger = structlog.get_logger()
+
+# Fallback message when Claude produces no text but did use tools.
+TASK_COMPLETED_MSG = "✅ Task completed. Tools used: {tools_summary}"
+
+SDK_STREAM_QUEUE_MAXSIZE = 256
+SDK_STREAM_COALESCE_WINDOW_SECONDS = 1.5
+SDK_STREAM_COALESCE_MAX_BATCH = 15
+DELIVERY_KIND_TEXT = "text"
+DELIVERY_KIND_TOOL_SUMMARY_INTERNAL = "tool_summary_internal"
+DELIVERY_KIND_FINAL_USER_RESPONSE = "final_user_response"
+DELIVERY_KIND_ERROR_FALLBACK = "error_fallback"
+DELIVERY_KINDS = {
+    DELIVERY_KIND_TEXT,
+    DELIVERY_KIND_TOOL_SUMMARY_INTERNAL,
+    DELIVERY_KIND_FINAL_USER_RESPONSE,
+    DELIVERY_KIND_ERROR_FALLBACK,
+}
+
+
+def _log_delivery(
+    delivery_kind: str,
+    *,
+    content_source: str,
+    content_length: int = 0,
+    tools_count: int = 0,
+    error_type: Optional[str] = None,
+) -> None:
+    """Log delivery metadata without user/assistant response bodies."""
+    if delivery_kind not in DELIVERY_KINDS:
+        delivery_kind = DELIVERY_KIND_TEXT
+
+    log_fields: Dict[str, Any] = {
+        "delivery_kind": delivery_kind,
+        "content_source": content_source,
+        "content_length": max(0, int(content_length)),
+        "tools_count": max(0, int(tools_count)),
+    }
+    if error_type:
+        log_fields["error_type"] = error_type
+
+    logger.info("delivery", **log_fields)
+
+
+def _log_error_delivery(error_type: str) -> None:
+    _log_delivery(
+        DELIVERY_KIND_ERROR_FALLBACK,
+        content_source="exception",
+        error_type=error_type,
+    )
+
+
+def delivery_metrics_report(
+    events: Iterable[Mapping[str, Any]], alert_threshold: float = 0.05
+) -> List[Dict[str, Any]]:
+    """Build a daily tool-summary rate report from structured delivery events."""
+    daily: Dict[str, Dict[str, int]] = {}
+    for event in events:
+        delivery_kind = event.get("delivery_kind")
+        if delivery_kind not in DELIVERY_KINDS:
+            continue
+
+        timestamp = event.get("timestamp") or event.get("date")
+        if not isinstance(timestamp, str) or len(timestamp) < 10:
+            continue
+
+        day = timestamp[:10]
+        day_counts = daily.setdefault(day, {"total": 0, "tool_summary_internal": 0})
+        day_counts["total"] += 1
+        if delivery_kind == DELIVERY_KIND_TOOL_SUMMARY_INTERNAL:
+            day_counts["tool_summary_internal"] += 1
+
+    report: List[Dict[str, Any]] = []
+    for day in sorted(daily):
+        counts = daily[day]
+        total = counts["total"]
+        tool_summary_count = counts["tool_summary_internal"]
+        rate = tool_summary_count / total if total else 0.0
+        report.append(
+            {
+                "date": day,
+                "total": total,
+                "tool_summary_internal": tool_summary_count,
+                "tool_summary_internal_rate": rate,
+                "alert": rate > alert_threshold,
+            }
+        )
+
+    return report
+
+
+def format_delivery_metrics_dashboard(report: Iterable[Mapping[str, Any]]) -> str:
+    """Format delivery metrics as an operator-readable daily dashboard."""
+    rows = list(report)
+    if not rows:
+        return "Delivery metrics dashboard\nNo delivery events found."
+
+    lines = [
+        "Delivery metrics dashboard",
+        "date | total | tool_summary_internal | rate | status",
+    ]
+    for row in rows:
+        rate = float(row.get("tool_summary_internal_rate") or 0.0)
+        status = "ALERT" if row.get("alert") else "OK"
+        lines.append(
+            f"{row.get('date')} | {row.get('total', 0)} | "
+            f"{row.get('tool_summary_internal', 0)} | {rate:.2%} | {status}"
+        )
+    return "\n".join(lines)
+
+
+def _format_ask_user_question_tool(tool_input: Dict[str, Any]) -> str:
+    """Render AskUserQuestion as plain user-facing text for Telegram delivery."""
+    question = str(tool_input.get("question") or "").strip()
+    raw_choices = tool_input.get("choices") or []
+
+    lines: List[str] = []
+    if question:
+        lines.append(question)
+
+    if isinstance(raw_choices, list):
+        choices = [str(choice).strip() for choice in raw_choices if str(choice).strip()]
+    else:
+        choices = []
+
+    if choices:
+        if lines:
+            lines.append("")
+        lines.extend(f"{idx}) {choice}" for idx, choice in enumerate(choices, start=1))
+
+    return "\n".join(lines).strip()
+
+
+@dataclass
+class ClaudeResponse:
+    """Response from Claude Code SDK."""
+
+    content: str
+    session_id: str
+    cost: float
+    duration_ms: int
+    num_turns: int
+    is_error: bool = False
+    error_type: Optional[str] = None
+    tools_used: List[Dict[str, Any]] = field(default_factory=list)
+    interrupted: bool = False
+    token_count: int = 0
+
+
+@dataclass
+class StreamUpdate:
+    """Streaming update from Claude SDK."""
+
+    type: str  # 'assistant', 'user', 'system', 'result', 'stream_delta'
+    content: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    progress: Optional[Dict[str, Any]] = None
+
+    def get_tool_names(self) -> List[str]:
+        """Return tool names from the stream payload."""
+        names: List[str] = []
+
+        if self.tool_calls:
+            for tool_call in self.tool_calls:
+                name = tool_call.get("name") if isinstance(tool_call, dict) else None
+                if isinstance(name, str) and name:
+                    names.append(name)
+
+        if self.metadata:
+            tool_name = self.metadata.get("tool_name")
+            if isinstance(tool_name, str) and tool_name:
+                names.append(tool_name)
+
+            metadata_tools = self.metadata.get("tools")
+            if isinstance(metadata_tools, list):
+                for tool in metadata_tools:
+                    if isinstance(tool, dict):
+                        name = tool.get("name")
+                    elif isinstance(tool, str):
+                        name = tool
+                    else:
+                        name = None
+
+                    if isinstance(name, str) and name:
+                        names.append(name)
+
+        # Preserve insertion order while de-duplicating.
+        return list(dict.fromkeys(names))
+
+    def is_error(self) -> bool:
+        """Check whether this stream update represents an error."""
+        if self.type == "error":
+            return True
+
+        if self.metadata:
+            if self.metadata.get("is_error") is True:
+                return True
+            status = self.metadata.get("status")
+            if isinstance(status, str) and status.lower() == "error":
+                return True
+            error_val = self.metadata.get("error")
+            if isinstance(error_val, str) and error_val:
+                return True
+            error_msg_val = self.metadata.get("error_message")
+            if isinstance(error_msg_val, str) and error_msg_val:
+                return True
+
+        if self.progress:
+            status = self.progress.get("status")
+            if isinstance(status, str) and status.lower() == "error":
+                return True
+
+        return False
+
+    def get_error_message(self) -> str:
+        """Get the best available error message from the stream payload."""
+        if self.metadata:
+            for key in ("error_message", "error", "message"):
+                value = self.metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+
+        if isinstance(self.content, str) and self.content.strip():
+            return self.content
+
+        if self.progress:
+            value = self.progress.get("error")
+            if isinstance(value, str) and value.strip():
+                return value
+
+        return "Unknown error"
+
+    def get_progress_percentage(self) -> Optional[int]:
+        """Extract progress percentage if present."""
+
+        def _to_int(value: Any) -> Optional[int]:
+            if isinstance(value, (int, float)):
+                return int(value)
+            if isinstance(value, str) and value.strip():
+                try:
+                    return int(float(value))
+                except ValueError:
+                    return None
+            return None
+
+        if self.progress:
+            for key in ("percentage", "percent", "progress"):
+                percentage = _to_int(self.progress.get(key))
+                if percentage is not None:
+                    return max(0, min(100, percentage))
+
+            step = _to_int(self.progress.get("step"))
+            total_steps = _to_int(self.progress.get("total_steps"))
+            if step is not None and total_steps and total_steps > 0:
+                return max(0, min(100, int((step / total_steps) * 100)))
+
+        if self.metadata:
+            percentage = _to_int(self.metadata.get("progress_percentage"))
+            if percentage is not None:
+                return max(0, min(100, percentage))
+
+        return None
+
+
+def _extract_result_token_count(message: ResultMessage) -> int:
+    """Best-effort token count from SDK ResultMessage usage fields."""
+    total = 0
+    usage = getattr(message, "usage", None) or {}
+    if isinstance(usage, Mapping):
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ):
+            value = usage.get(key)
+            if isinstance(value, (int, float)):
+                total += int(value)
+
+    model_usage = getattr(message, "model_usage", None) or {}
+    if isinstance(model_usage, Mapping):
+        for value in model_usage.values():
+            if not isinstance(value, Mapping):
+                continue
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ):
+                item = value.get(key)
+                if isinstance(item, (int, float)):
+                    total += int(item)
+    return max(0, total)
+
+
+def _is_stream_delta(message: Message) -> bool:
+    """Return True only for user-visible incremental SDK text delta events."""
+    if not isinstance(message, StreamEvent):
+        return False
+
+    event = message.event or {}
+    if event.get("type") != "content_block_delta":
+        return False
+
+    delta = event.get("delta", {})
+    return delta.get("type") == "text_delta" and bool(delta.get("text"))
+
+
+def _consolidate_stream_deltas(deltas: List[Message]) -> Message:
+    """Concatenate incremental StreamEvent deltas into one stream delta message."""
+    stream_events = [delta for delta in deltas if isinstance(delta, StreamEvent)]
+    if not stream_events:
+        raise ValueError("Cannot consolidate an empty stream delta batch")
+
+    text_parts: List[str] = []
+    for stream_event in stream_events:
+        delta = (stream_event.event or {}).get("delta", {})
+        if delta.get("type") == "text_delta":
+            text_parts.append(delta.get("text", ""))
+
+    last_event = stream_events[-1]
+    return StreamEvent(
+        uuid=getattr(last_event, "uuid", ""),
+        session_id=getattr(last_event, "session_id", ""),
+        parent_tool_use_id=getattr(last_event, "parent_tool_use_id", None),
+        event={
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "".join(text_parts)},
+        },
+    )
+
+
+def _make_can_use_tool_callback(
+    security_validator: SecurityValidator,
+    working_directory: Path,
+    approved_directory: Path,
+) -> Any:
+    """Create a can_use_tool callback for SDK-level tool permission validation.
+
+    The callback validates file path boundaries and bash directory boundaries
+    *before* the SDK executes the tool, providing preventive security enforcement.
+    """
+    _FILE_TOOLS = {"Write", "Edit", "Read", "create_file", "edit_file", "read_file"}
+    _BASH_TOOLS = {"Bash", "bash", "shell"}
+
+    async def can_use_tool(
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> Any:
+        # File path validation
+        if tool_name in _FILE_TOOLS:
+            file_path = tool_input.get("file_path") or tool_input.get("path")
+            if file_path:
+                # Allow Claude Code internal paths (~/.claude/plans/, etc.)
+                if _is_claude_internal_path(file_path):
+                    return PermissionResultAllow()
+
+                valid, _resolved, error = security_validator.validate_path(
+                    file_path, working_directory
+                )
+                if not valid:
+                    logger.warning(
+                        "can_use_tool denied file operation",
+                        tool_name=tool_name,
+                        file_path=file_path,
+                        error=error,
+                    )
+                    return PermissionResultDeny(message=error or "Invalid file path")
+
+        # Bash directory boundary validation
+        if tool_name in _BASH_TOOLS:
+            command = tool_input.get("command", "")
+            if command:
+                valid, error = check_bash_directory_boundary(
+                    command, working_directory, approved_directory
+                )
+                if not valid:
+                    logger.warning(
+                        "can_use_tool denied bash command",
+                        tool_name=tool_name,
+                        command=command,
+                        error=error,
+                    )
+                    return PermissionResultDeny(
+                        message=error or "Bash directory boundary violation"
+                    )
+
+        return PermissionResultAllow()
+
+    return can_use_tool
+
+
+class ClaudeSDKManager:
+    """Manage Claude Code SDK integration."""
+
+    def __init__(
+        self,
+        config: Settings,
+        security_validator: Optional[SecurityValidator] = None,
+    ):
+        """Initialize SDK manager with configuration."""
+        self.config = config
+        self.security_validator = security_validator
+
+        # Project policy: never authenticate Claude via paid Anthropic API key.
+        # The SDK must use existing Claude CLI/OAuth authentication only.
+        if os.environ.pop("ANTHROPIC_API_KEY", None) is not None:
+            logger.warning(
+                "Removed unsupported Anthropic API key from environment; "
+                "using Claude CLI/OAuth authentication"
+            )
+        else:
+            logger.info("Using existing Claude CLI/OAuth authentication")
+
+    def _is_retryable_error(self, exc: BaseException) -> bool:
+        """Return True for transient errors that warrant a retry.
+        asyncio.TimeoutError is intentional (user-configured timeout) — not retried.
+        Only non-MCP CLIConnectionError is considered transient.
+        """
+        if isinstance(exc, CLIConnectionError):
+            msg = str(exc).lower()
+            return "mcp" not in msg  # "server" alone is too broad
+        return False
+
+    async def execute_command(
+        self,
+        prompt: str,
+        working_directory: Path,
+        session_id: Optional[str] = None,
+        continue_session: bool = False,
+        stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        interrupt_event: Optional[asyncio.Event] = None,
+        images: Optional[List[Dict[str, str]]] = None,
+        goal_manager: Optional[GoalManager] = None,
+        chat_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+        ask_user_question_bot: Optional[Any] = None,
+        ask_user_question_chat_id: Optional[int] = None,
+        ask_user_question_thread_id: Optional[int] = None,
+        ask_user_question_registry: Optional[AskUserQuestionRegistry] = None,
+    ) -> ClaudeResponse:
+        """Execute Claude Code command via SDK."""
+        start_time = asyncio.get_event_loop().time()
+
+        logger.info(
+            "Starting Claude SDK command",
+            working_directory=str(working_directory),
+            session_id=session_id,
+            continue_session=continue_session,
+        )
+
+        try:
+            # Capture stderr from Claude CLI for better error diagnostics
+            stderr_lines: List[str] = []
+
+            def _stderr_callback(line: str) -> None:
+                stderr_lines.append(line)
+                logger.debug("Claude CLI stderr", line=line)
+
+            # Build system prompt, loading CLAUDE.md from working directory if present
+            base_prompt = (
+                f"All file operations must stay within {working_directory}. "
+                "Use relative paths."
+            )
+            claude_md_path = Path(working_directory) / "CLAUDE.md"
+            if claude_md_path.exists():
+                base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
+                logger.info(
+                    "Loaded CLAUDE.md into system prompt",
+                    path=str(claude_md_path),
+                )
+
+            # When DISABLE_TOOL_VALIDATION=true, do not pass None here.
+            # claude-agent-sdk currently calls list(options.allowed_tools) while
+            # applying skill defaults, so None crashes before Claude starts.
+            # An empty list means "no explicit restriction from this wrapper".
+            if self.config.disable_tool_validation:
+                sdk_allowed_tools = []
+                sdk_disallowed_tools = []
+            else:
+                sdk_allowed_tools = self.config.claude_allowed_tools or []
+                sdk_disallowed_tools = self.config.claude_disallowed_tools or []
+
+            # Build Claude Agent options
+            options = ClaudeAgentOptions(
+                max_turns=self.config.claude_max_turns,
+                model=self.config.claude_model or None,
+                max_budget_usd=self.config.claude_max_cost_per_request,
+                cwd=str(working_directory),
+                allowed_tools=sdk_allowed_tools,
+                disallowed_tools=sdk_disallowed_tools,
+                cli_path=self.config.claude_cli_path or None,
+                include_partial_messages=stream_callback is not None,
+                sandbox={
+                    "enabled": self.config.sandbox_enabled,
+                    "autoAllowBashIfSandboxed": True,
+                    "excludedCommands": self.config.sandbox_excluded_commands or [],
+                },
+                system_prompt=base_prompt,
+                setting_sources=["project", "user"],
+                stderr=_stderr_callback,
+            )
+
+            if (
+                ask_user_question_bot is not None
+                and ask_user_question_chat_id is not None
+            ):
+                registry = (
+                    ask_user_question_registry or DEFAULT_ASK_USER_QUESTION_REGISTRY
+                )
+                options.hooks = options.hooks or {}
+                options.hooks.setdefault("PreToolUse", []).append(
+                    HookMatcher(
+                        matcher="AskUserQuestion",
+                        hooks=[
+                            registry.build_pre_tool_use_hook(
+                                bot=ask_user_question_bot,
+                                chat_id=ask_user_question_chat_id,
+                                message_thread_id=ask_user_question_thread_id,
+                                timeout_seconds=ASK_USER_QUESTION_TIMEOUT_SECONDS,
+                            )
+                        ],
+                    )
+                )
+
+            if (
+                goal_manager is not None
+                and chat_id is not None
+                and message_thread_id is not None
+            ):
+                goal = await goal_manager.repo.get_active(chat_id, message_thread_id)
+                if goal is not None:
+                    options.hooks = options.hooks or {}
+                    options.hooks.setdefault("Stop", []).append(
+                        HookMatcher(
+                            hooks=[
+                                goal_manager.build_stop_hook(chat_id, message_thread_id)
+                            ]
+                        )
+                    )
+
+            # Pass MCP server configuration if enabled
+            if self.config.enable_mcp and self.config.mcp_config_path:
+                options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
+                logger.info(
+                    "MCP servers configured",
+                    mcp_config_path=str(self.config.mcp_config_path),
+                )
+
+            # Wire can_use_tool callback for preventive tool validation
+            if self.security_validator:
+                options.can_use_tool = _make_can_use_tool_callback(
+                    security_validator=self.security_validator,
+                    working_directory=working_directory,
+                    approved_directory=self.config.approved_directory,
+                )
+
+            # Resume previous session if we have a session_id
+            if session_id and continue_session:
+                options.resume = session_id
+                logger.info(
+                    "Resuming previous session",
+                    session_id=session_id,
+                )
+
+            # Collect messages via ClaudeSDKClient
+            messages: List[Message] = []
+            interrupted = False
+            worker_metrics: Dict[str, float] = {
+                "queue_depth_max": 0,
+                "coalesced": 0,
+                "dropped": 0,
+                "worker_lag_ms_max": 0,
+            }
+
+            async def _run_client() -> None:
+                client = ClaudeSDKClient(options)
+                try:
+                    await client.connect()
+
+                    if images:
+                        content_blocks: List[Dict[str, Any]] = []
+                        for img in images:
+                            media_type = img.get("media_type", "image/png")
+                            content_blocks.append(
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": img["data"],
+                                    },
+                                }
+                            )
+                        content_blocks.append({"type": "text", "text": prompt})
+
+                        multimodal_msg = {
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": content_blocks,
+                            },
+                        }
+
+                        async def _multimodal_prompt() -> AsyncIterator[Dict[str, Any]]:
+                            yield multimodal_msg
+
+                        await client.query(_multimodal_prompt())
+                    else:
+                        await client.query(prompt)
+
+                    if not stream_callback:
+                        async for raw_data in client._query.receive_messages():
+                            try:
+                                message = parse_message(raw_data)
+                            except MessageParseError as e:
+                                logger.debug(
+                                    "Skipping unparseable message",
+                                    error=str(e),
+                                )
+                                continue
+
+                            messages.append(message)
+
+                            if isinstance(message, ResultMessage):
+                                break
+                        return
+
+                    queue: asyncio.Queue[Optional[Message]] = asyncio.Queue(
+                        maxsize=SDK_STREAM_QUEUE_MAXSIZE
+                    )
+                    worker_metrics.update(
+                        {
+                            "queue_depth_max": 0,
+                            "coalesced": 0,
+                            "dropped": 0,
+                            "worker_lag_ms_max": 0,
+                        }
+                    )
+
+                    async def _handle_with_metrics(message: Message) -> None:
+                        t0 = time.monotonic()
+                        try:
+                            await self._handle_stream_message(message, stream_callback)
+                        except Exception as callback_error:
+                            logger.warning(
+                                "Stream callback failed",
+                                error=str(callback_error),
+                                error_type=type(callback_error).__name__,
+                            )
+                        finally:
+                            lag_ms = (time.monotonic() - t0) * 1000
+                            worker_metrics["worker_lag_ms_max"] = max(
+                                worker_metrics["worker_lag_ms_max"], lag_ms
+                            )
+
+                    async def _flush_pending(pending_deltas: List[Message]) -> None:
+                        if not pending_deltas:
+                            return
+
+                        consolidated = _consolidate_stream_deltas(pending_deltas)
+                        worker_metrics["coalesced"] += len(pending_deltas)
+                        await _handle_with_metrics(consolidated)
+
+                    async def _producer() -> None:
+                        async for raw_data in client._query.receive_messages():
+                            try:
+                                message = parse_message(raw_data)
+                            except MessageParseError as e:
+                                logger.debug(
+                                    "Skipping unparseable message",
+                                    error=str(e),
+                                )
+                                continue
+
+                            messages.append(message)
+
+                            if queue.full() and _is_stream_delta(message):
+                                worker_metrics["dropped"] += 1
+                                continue
+
+                            await queue.put(message)
+                            worker_metrics["queue_depth_max"] = max(
+                                worker_metrics["queue_depth_max"], queue.qsize()
+                            )
+
+                            if isinstance(message, ResultMessage):
+                                await queue.put(None)
+                                worker_metrics["queue_depth_max"] = max(
+                                    worker_metrics["queue_depth_max"], queue.qsize()
+                                )
+                                return
+
+                        await queue.put(None)
+                        worker_metrics["queue_depth_max"] = max(
+                            worker_metrics["queue_depth_max"], queue.qsize()
+                        )
+
+                    async def _consumer() -> None:
+                        pending_deltas: List[Message] = []
+                        last_flush = time.monotonic()
+
+                        while True:
+                            timeout = max(
+                                0.05,
+                                SDK_STREAM_COALESCE_WINDOW_SECONDS
+                                - (time.monotonic() - last_flush),
+                            )
+                            try:
+                                message = await asyncio.wait_for(
+                                    queue.get(), timeout=timeout
+                                )
+                            except asyncio.TimeoutError:
+                                await _flush_pending(pending_deltas)
+                                pending_deltas = []
+                                last_flush = time.monotonic()
+                                continue
+
+                            if message is None:
+                                await _flush_pending(pending_deltas)
+                                return
+
+                            if isinstance(message, ResultMessage):
+                                await _flush_pending(pending_deltas)
+                                pending_deltas = []
+                                last_flush = time.monotonic()
+                                continue
+
+                            if _is_stream_delta(message):
+                                pending_deltas.append(message)
+                                if (
+                                    time.monotonic() - last_flush
+                                    >= SDK_STREAM_COALESCE_WINDOW_SECONDS
+                                    or len(pending_deltas)
+                                    >= SDK_STREAM_COALESCE_MAX_BATCH
+                                ):
+                                    await _flush_pending(pending_deltas)
+                                    pending_deltas = []
+                                    last_flush = time.monotonic()
+                                continue
+
+                            if pending_deltas:
+                                await _flush_pending(pending_deltas)
+                                pending_deltas = []
+                                last_flush = time.monotonic()
+
+                            await _handle_with_metrics(message)
+
+                    producer_task = asyncio.create_task(_producer())
+                    consumer_task = asyncio.create_task(_consumer())
+                    try:
+                        await asyncio.gather(producer_task, consumer_task)
+                    finally:
+                        for task in (producer_task, consumer_task):
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(
+                            producer_task, consumer_task, return_exceptions=True
+                        )
+
+                finally:
+                    await client.disconnect()
+
+            # Execute with timeout and retry, racing against optional interrupt
+            max_attempts = max(1, self.config.claude_retry_max_attempts)
+            last_exc: Optional[BaseException] = None
+
+            for attempt in range(max_attempts):
+                # Reset message accumulator each attempt so that a failed attempt
+                # does not pollute the next one with partial/duplicate messages.
+                # _run_client() closes over `messages` by reference (late-binding
+                # closure), so clearing it here is seen by every new call.
+                messages.clear()
+
+                if attempt > 0:
+                    delay = min(
+                        self.config.claude_retry_base_delay
+                        * (self.config.claude_retry_backoff_factor ** (attempt - 1)),
+                        self.config.claude_retry_max_delay,
+                    )
+                    logger.warning(
+                        "Retrying Claude SDK command",
+                        attempt=attempt + 1,
+                        max_attempts=max_attempts,
+                        delay_seconds=delay,
+                    )
+                    await asyncio.sleep(delay)
+
+                run_task = asyncio.create_task(_run_client())
+
+                interrupt_watcher: Optional["asyncio.Task[None]"] = None
+                if interrupt_event is not None:
+
+                    async def _cancel_on_interrupt() -> None:
+                        nonlocal interrupted
+                        await interrupt_event.wait()
+                        interrupted = True
+                        run_task.cancel()
+
+                    interrupt_watcher = asyncio.create_task(_cancel_on_interrupt())
+
+                # Note: asyncio.TimeoutError is intentionally NOT retried —
+                # it reflects a user-configured hard limit.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(run_task),
+                        timeout=self.config.claude_timeout_seconds,
+                    )
+                    break  # success — exit retry loop
+                except asyncio.CancelledError:
+                    if not interrupted:
+                        raise
+                    # Interrupt cancelled the task — wait for cleanup
+                    try:
+                        await run_task
+                    except asyncio.CancelledError:
+                        pass
+                    break  # user interrupted — don't retry
+                except asyncio.TimeoutError:
+                    run_task.cancel()
+                    try:
+                        await run_task
+                    except asyncio.CancelledError:
+                        pass
+                    raise  # timeout — don't retry
+                except CLIConnectionError as exc:
+                    if self._is_retryable_error(exc) and attempt < max_attempts - 1:
+                        last_exc = exc
+                        logger.warning(
+                            "Transient connection error, will retry",
+                            attempt=attempt + 1,
+                            error=str(exc),
+                        )
+                        continue
+                    raise  # non-retryable or attempts exhausted
+                finally:
+                    if interrupt_watcher is not None:
+                        interrupt_watcher.cancel()
+            else:
+                if last_exc is not None:
+                    raise last_exc
+
+            # Extract cost, tools, and session_id from result message
+            cost = 0.0
+            tools_used: List[Dict[str, Any]] = []
+            claude_session_id = None
+            result_content = None
+            token_count = 0
+            for message in messages:
+                if isinstance(message, ResultMessage):
+                    cost = getattr(message, "total_cost_usd", 0.0) or 0.0
+                    claude_session_id = getattr(message, "session_id", None)
+                    result_content = getattr(message, "result", None)
+                    token_count = _extract_result_token_count(message)
+                    current_time = asyncio.get_event_loop().time()
+                    for msg in messages:
+                        if isinstance(msg, AssistantMessage):
+                            msg_content = getattr(msg, "content", [])
+                            if msg_content and isinstance(msg_content, list):
+                                for block in msg_content:
+                                    if isinstance(block, ToolUseBlock):
+                                        tools_used.append(
+                                            {
+                                                "name": getattr(
+                                                    block, "name", "unknown"
+                                                ),
+                                                "timestamp": current_time,
+                                                "input": getattr(block, "input", {}),
+                                            }
+                                        )
+                    break
+
+            # Fallback: extract session_id from StreamEvent messages if
+            # ResultMessage didn't provide one (can happen with some CLI versions)
+            if not claude_session_id:
+                for message in messages:
+                    msg_session_id = getattr(message, "session_id", None)
+                    if msg_session_id and not isinstance(message, ResultMessage):
+                        claude_session_id = msg_session_id
+                        logger.info(
+                            "Got session ID from stream event (fallback)",
+                            session_id=claude_session_id,
+                        )
+                        break
+
+            # Calculate duration
+            duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            num_turns = len(
+                [m for m in messages if isinstance(m, (UserMessage, AssistantMessage))]
+            )
+
+            # Use Claude's session_id if available, otherwise fall back
+            final_session_id = claude_session_id or session_id or ""
+
+            if claude_session_id and claude_session_id != session_id:
+                logger.info(
+                    "Got session ID from Claude",
+                    claude_session_id=claude_session_id,
+                    previous_session_id=session_id,
+                )
+
+            # Use ResultMessage.result if available; treat empty/whitespace
+            # values as missing so we fall back to message-level extraction
+            # (JAR-114: avoid the TASK_COMPLETED_MSG fallback when Claude
+            # actually produced text via AssistantMessage TextBlocks or
+            # streamed text deltas).
+            content = ""
+            content_source = "empty"
+            delivery_kind = DELIVERY_KIND_TEXT
+            if result_content is not None and str(result_content).strip():
+                content = str(result_content).strip()
+                content_source = "result_message"
+                delivery_kind = DELIVERY_KIND_FINAL_USER_RESPONSE
+            else:
+                content_parts: List[str] = []
+                for msg in messages:
+                    if isinstance(msg, AssistantMessage):
+                        msg_content = getattr(msg, "content", [])
+                        if msg_content and isinstance(msg_content, list):
+                            for block in msg_content:
+                                if isinstance(block, TextBlock):
+                                    content_parts.append(block.text)
+                                elif isinstance(block, ToolUseBlock):
+                                    if (
+                                        getattr(block, "name", "") == "AskUserQuestion"
+                                        and ask_user_question_bot is None
+                                    ):
+                                        prompt_text = _format_ask_user_question_tool(
+                                            getattr(block, "input", {}) or {}
+                                        )
+                                        if prompt_text:
+                                            content_parts.append(prompt_text)
+                                    continue
+                                elif isinstance(block, ThinkingBlock):
+                                    # Thinking content is internal reasoning;
+                                    # skip when reconstructing the user reply.
+                                    continue
+                                elif hasattr(block, "text"):
+                                    content_parts.append(block.text)
+                        elif msg_content:
+                            content_parts.append(str(msg_content))
+                content = "\n".join(content_parts).strip()
+                if content:
+                    content_source = "assistant_text"
+                    delivery_kind = DELIVERY_KIND_FINAL_USER_RESPONSE
+
+                # Final fallback: reconstruct the assistant reply from
+                # StreamEvent text/thinking deltas when no AssistantMessage
+                # TextBlock made it into the buffer (e.g., stream-only flows
+                # where the SDK emits incremental deltas but no finalized
+                # AssistantMessage with text). Without this, JAR-114 surfaces
+                # the TASK_COMPLETED_MSG template instead of Claude's real
+                # answer.
+                if not content:
+                    delta_parts: List[str] = []
+                    for msg in messages:
+                        if not isinstance(msg, StreamEvent):
+                            continue
+                        event = getattr(msg, "event", None) or {}
+                        if event.get("type") != "content_block_delta":
+                            continue
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                            if text:
+                                delta_parts.append(text)
+                    content = "".join(delta_parts).strip()
+                    if content:
+                        content_source = "stream_delta"
+                        delivery_kind = DELIVERY_KIND_FINAL_USER_RESPONSE
+
+            if not content and tools_used:
+                tool_names = [
+                    tool.get("name", "")
+                    for tool in tools_used
+                    if isinstance(tool.get("name"), str) and tool.get("name")
+                ]
+                unique_tool_names = list(dict.fromkeys(tool_names))
+                tools_summary = ", ".join(unique_tool_names) or "unknown"
+                content = TASK_COMPLETED_MSG.format(tools_summary=tools_summary)
+                content_source = "tool_summary_fallback"
+                delivery_kind = DELIVERY_KIND_TOOL_SUMMARY_INTERNAL
+
+            _log_delivery(
+                delivery_kind,
+                content_source=content_source,
+                content_length=len(content),
+                tools_count=len(tools_used),
+            )
+
+            logger.info(
+                "claude_run_complete",
+                queue_depth_max=int(worker_metrics["queue_depth_max"]),
+                coalesced_count=int(worker_metrics["coalesced"]),
+                dropped_count=int(worker_metrics["dropped"]),
+                worker_lag_ms_max=int(worker_metrics["worker_lag_ms_max"]),
+                duration_ms=duration_ms,
+                num_turns=num_turns,
+            )
+
+            return ClaudeResponse(
+                content=content,
+                session_id=final_session_id,
+                cost=cost,
+                duration_ms=duration_ms,
+                num_turns=num_turns,
+                tools_used=tools_used,
+                interrupted=interrupted,
+                token_count=token_count,
+            )
+
+        except asyncio.TimeoutError:
+            _log_error_delivery("TimeoutError")
+            logger.error(
+                "Claude SDK command timed out",
+                timeout_seconds=self.config.claude_timeout_seconds,
+            )
+            raise ClaudeTimeoutError(
+                f"Claude SDK timed out after {self.config.claude_timeout_seconds}s"
+            )
+
+        except CLINotFoundError as e:
+            _log_error_delivery(type(e).__name__)
+            logger.error("Claude CLI not found", error=str(e))
+            error_msg = (
+                "Claude Code not found. Please ensure Claude is installed:\n"
+                "  npm install -g @anthropic-ai/claude-code\n\n"
+                "If already installed, try one of these:\n"
+                "  1. Add Claude to your PATH\n"
+                "  2. Create a symlink: ln -s $(which claude) /usr/local/bin/claude\n"
+                "  3. Set CLAUDE_CLI_PATH environment variable"
+            )
+            raise ClaudeProcessError(error_msg)
+
+        except ProcessError as e:
+            _log_error_delivery(type(e).__name__)
+            error_str = str(e)
+            # Include captured stderr for better diagnostics
+            captured_stderr = "\n".join(stderr_lines[-20:]) if stderr_lines else ""
+            if captured_stderr:
+                error_str = f"{error_str}\nStderr: {captured_stderr}"
+            logger.error(
+                "Claude process failed",
+                error=error_str,
+                exit_code=getattr(e, "exit_code", None),
+                stderr=captured_stderr or None,
+            )
+            # Check if the process error is MCP-related
+            if "mcp" in error_str.lower():
+                raise ClaudeMCPError(f"MCP server error: {error_str}")
+            raise ClaudeProcessError(f"Claude process error: {error_str}")
+
+        except CLIConnectionError as e:
+            _log_error_delivery(type(e).__name__)
+            error_str = str(e)
+            logger.error("Claude connection error", error=error_str)
+            # Check if the connection error is MCP-related
+            if "mcp" in error_str.lower() or "server" in error_str.lower():
+                raise ClaudeMCPError(f"MCP server connection failed: {error_str}")
+            raise ClaudeProcessError(f"Failed to connect to Claude: {error_str}")
+
+        except CLIJSONDecodeError as e:
+            _log_error_delivery(type(e).__name__)
+            logger.error("Claude SDK JSON decode error", error=str(e))
+            raise ClaudeParsingError(f"Failed to decode Claude response: {str(e)}")
+
+        except ClaudeSDKError as e:
+            _log_error_delivery(type(e).__name__)
+            logger.error("Claude SDK error", error=str(e))
+            raise ClaudeProcessError(f"Claude SDK error: {str(e)}")
+
+        except Exception as e:
+            _log_error_delivery(type(e).__name__)
+            exceptions = getattr(e, "exceptions", None)
+            if exceptions is not None:
+                # ExceptionGroup from TaskGroup operations (Python 3.11+)
+                logger.error(
+                    "Task group error in Claude SDK",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    exception_count=len(exceptions),
+                    exceptions=[str(ex) for ex in exceptions[:3]],
+                )
+                raise ClaudeProcessError(
+                    f"Claude SDK task error: {exceptions[0] if exceptions else e}"
+                )
+
+            logger.error(
+                "Unexpected error in Claude SDK",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            raise ClaudeProcessError(f"Unexpected error: {str(e)}")
+
+    async def _handle_stream_message(
+        self, message: Message, stream_callback: Callable[[StreamUpdate], None]
+    ) -> None:
+        """Handle streaming message from claude-agent-sdk."""
+        try:
+            if isinstance(message, AssistantMessage):
+                # Extract content from assistant message
+                content = getattr(message, "content", [])
+                text_parts = []
+                tool_calls = []
+
+                if content and isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, ToolUseBlock):
+                            tool_calls.append(
+                                {
+                                    "name": block.name,
+                                    "input": block.input,
+                                    "id": block.id,
+                                }
+                            )
+                        elif isinstance(block, TextBlock):
+                            text_parts.append(block.text)
+                        elif isinstance(block, ThinkingBlock):
+                            # Thinking content is internal reasoning; never stream it to Telegram.
+                            continue
+
+                    if text_parts or tool_calls:
+                        update = StreamUpdate(
+                            type="assistant",
+                            content=("\n".join(text_parts) if text_parts else None),
+                            tool_calls=tool_calls if tool_calls else None,
+                        )
+                        await stream_callback(update)
+                    # When the list contained only ThinkingBlocks, do NOT fall through to
+                    # str(content) — that would leak "[ThinkingBlock(thinking='...')]" to Telegram.
+                elif content:
+                    # Fallback for non-list content (e.g., plain string AssistantMessage).
+                    update = StreamUpdate(
+                        type="assistant",
+                        content=str(content),
+                    )
+                    await stream_callback(update)
+
+            elif isinstance(message, StreamEvent):
+                event = message.event or {}
+                if event.get("type") == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text", "")
+                        if text:
+                            update = StreamUpdate(
+                                type="stream_delta",
+                                content=text,
+                            )
+                            await stream_callback(update)
+
+            elif isinstance(message, UserMessage):
+                content = getattr(message, "content", "")
+                if content:
+                    update = StreamUpdate(
+                        type="user",
+                        content=content,
+                    )
+                    await stream_callback(update)
+
+        except Exception as e:
+            logger.warning(
+                "Stream callback failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+
+    def _load_mcp_config(self, config_path: Path) -> Dict[str, Any]:
+        """Load MCP server configuration from a JSON file.
+
+        The new claude-agent-sdk expects mcp_servers as a dict, not a file path.
+        """
+        import json
+
+        try:
+            with open(config_path) as f:
+                config_data = json.load(f)
+            return config_data.get("mcpServers", {})
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(
+                "Failed to load MCP config", path=str(config_path), error=str(e)
+            )
+            return {}

@@ -1,0 +1,10 @@
+projects:
+  - slug: telegram-claude-code-bridge
+    name: Telegram Claude Code Bridge
+    path: .
+    enabled: true
+
+  - slug: docs
+    name: Documentation
+    path: docs
+    enabled: true
