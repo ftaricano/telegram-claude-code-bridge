@@ -68,7 +68,7 @@ include = ["src", "README.md", "LICENSE", "NOTICE", "pyproject.toml"]
 
 [dependency-groups]
 dev = [
-    "pytest>=8.4.0,<9",
+    "pytest>=9.0.3,<10",
     "pytest-asyncio>=1.0.0,<2",
     "pytest-cov>=6.1.1,<7",
     "pytest-mock>=3.14.1,<4",
