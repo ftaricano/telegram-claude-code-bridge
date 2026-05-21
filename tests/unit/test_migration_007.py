@@ -65,12 +65,10 @@ async def test_migration_007_is_idempotent(tmp_path):
         version = await cursor.fetchone()
         assert version[0] == CURRENT_VERSION
 
-        cursor = await conn.execute(
-            """
+        cursor = await conn.execute("""
             SELECT name FROM sqlite_master
             WHERE type = 'table' AND name = 'topic_sessions'
-        """
-        )
+        """)
         assert await cursor.fetchone() is not None
 
     await manager.close()
@@ -83,12 +81,10 @@ async def test_memory_database_smoke_sees_topic_sessions_table():
     await manager.initialize()
 
     async with manager.get_connection() as conn:
-        cursor = await conn.execute(
-            """
+        cursor = await conn.execute("""
             SELECT name FROM sqlite_master
             WHERE type = 'table' AND name = 'topic_sessions'
-        """
-        )
+        """)
         assert await cursor.fetchone() is not None
 
     await manager.close()
