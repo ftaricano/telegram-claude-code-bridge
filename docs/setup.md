@@ -26,7 +26,7 @@ claude auth login
 claude auth status
 # Should show: "You are authenticated"
 
-# Do not set ANTHROPIC_API_KEY — SDK uses Claude CLI/OAuth credentials
+# Do not set ANTHROPIC_API_KEY - SDK uses Claude CLI/OAuth credentials
 ```
 
 Direct Anthropic API key authentication is intentionally unsupported for this bot.
@@ -177,19 +177,19 @@ Choose your transcription provider:
 **Mistral Voxtral (default):**
 ```bash
 VOICE_PROVIDER=mistral
-MISTRAL_API_KEY=your-mistral-api-key
+MISTRAL_API_KEY=<MISTRAL_API_KEY>
 ```
 
 **OpenAI Whisper:**
 ```bash
 VOICE_PROVIDER=openai
-OPENAI_API_KEY=your-openai-api-key
+OPENAI_API_KEY=<OPENAI_API_KEY>
 ```
 
 **Local whisper.cpp (offline, no API key needed):**
 ```bash
 VOICE_PROVIDER=local
-# Optional — auto-detected from PATH if unset
+# Optional - auto-detected from PATH if unset
 WHISPER_CPP_BINARY_PATH=/usr/local/bin/whisper-cpp
 # Model name ("base", "small", "medium") or full path to .bin file
 WHISPER_CPP_MODEL_PATH=base
@@ -227,7 +227,7 @@ NOTIFICATION_CHAT_IDS=123456789,987654321
 #### Directory Isolation
 ```bash
 # Set to a specific project directory, not your home directory
-APPROVED_DIRECTORY=/Users/yourname/projects
+APPROVED_DIRECTORY=/path/to/projects
 ```
 
 #### User Access Control
@@ -237,7 +237,7 @@ ALLOWED_USERS=123456789,987654321
 
 # Optional: Token-based authentication
 ENABLE_TOKEN_AUTH=true
-AUTH_TOKEN_SECRET=your-secret-key-here
+AUTH_TOKEN_SECRET=<AUTH_TOKEN_SECRET>
 ```
 
 ### Rate Limiting
@@ -294,8 +294,8 @@ Do not bypass Claude CLI/OAuth with direct Anthropic API keys; this bot intentio
 
 ### Bot doesn't respond
 ```bash
-# Check your bot token
-echo $TELEGRAM_BOT_TOKEN
+# Verify the bot token variable is set without printing the token
+test -n "$TELEGRAM_BOT_TOKEN" && echo "TELEGRAM_BOT_TOKEN is set"
 
 # Verify user ID (message @userinfobot)
 # Check bot logs

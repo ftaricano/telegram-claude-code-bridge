@@ -31,7 +31,6 @@ dependencies = [
     "python-dotenv>=1.0.0,<2",
     "aiofiles>=24.1.0,<25",
     "aiosqlite>=0.21.0,<0.22",
-    "anthropic>=0.40.0,<0.41",
     "claude-agent-sdk>=0.1.39,<0.2",
     "fastapi>=0.115.0,<0.116",
     "uvicorn[standard]>=0.34.0,<0.35",

@@ -1,16 +1,22 @@
 # Contributing to Telegram Claude Code Bridge
 
-Thank you for your interest in contributing! This document provides guidelines for contributing to the project.
+Thank you for your interest in contributing. This document provides the
+expected development workflow for changes to this project.
 
 ## Development Status
 
-This project is currently under active development with the following status:
+This project is a public, usable bridge under active maintenance. The core bot,
+Claude Code SDK integration, persistence layer, security middleware, project
+thread routing, file handling, voice handling, and webhook surfaces are already
+implemented.
 
-- ✅ **Project Structure & Configuration** (Complete)
-- ✅ **Authentication & Security** (Complete)
-- ✅ **Bot Core & Integration** (TODO-4, TODO-5, Complete)
-- ✅ **Storage Layer** (TODO-6, Complete)
-- 🚧 **Advanced Features** (TODO-7, Next)
+Good contribution areas:
+
+- Documentation improvements
+- Tests for existing behavior
+- Security hardening
+- Reliability improvements for Telegram delivery and Claude Code sessions
+- Small, focused feature improvements
 
 ## Getting Started
 
@@ -32,7 +38,8 @@ This project is currently under active development with the following status:
    ```bash
    make dev
    ```
-   Behind the scenes this runs `uv sync` (resolves + installs everything into `.venv/`) and `uv run pre-commit install --install-hooks` (auto-formats with black/isort on each commit).
+   Behind the scenes this runs `uv sync` and installs dependencies into
+   `.venv/`. It also installs pre-commit hooks when available.
 
 3. **Set up configuration**:
    ```bash
@@ -60,11 +67,15 @@ This project is currently under active development with the following status:
 1. **Follow the project structure**:
    ```
    src/
-   ├── config/     # Configuration (✅ Complete)
-   ├── security/   # Authentication & Security (✅ Complete)
-   ├── bot/        # Telegram bot (✅ Complete - TODO-4)
-   ├── claude/     # Claude integration (✅ Complete - TODO-5)
-   └── storage/    # Database (✅ Complete - TODO-6)
+   |-- api/        # Optional HTTP/webhook server
+   |-- bot/        # Telegram bot runtime
+   |-- claude/     # Claude Code SDK integration
+   |-- config/     # Configuration loading and validation
+   |-- events/     # Event bus and event handlers
+   |-- mcp/        # MCP server surface
+   |-- projects/   # Project registry and topic mapping
+   |-- security/   # Auth, validators, rate limiting, audit logging
+   `-- storage/    # SQLite persistence and repositories
    ```
 
 2. **Write tests** for new functionality:
@@ -146,44 +157,6 @@ async def test_feature():
 
 ## Contribution Types
 
-### High Priority (Current TODOs)
-
-#### TODO-7: Advanced Features (Next Priority)
-- File upload handling with security validation
-- Git integration for repository operations
-- Quick actions system for common workflows
-- Session export features (Markdown, JSON, HTML)
-- Image/screenshot support and processing
-
-**Files to create/modify**:
-- `src/bot/handlers/file.py`
-- `src/git/integration.py`
-- `src/features/quick_actions.py`
-- `src/features/export.py`
-- `tests/unit/test_features.py`
-
-### Recently Completed ✅
-
-#### TODO-4: Telegram Bot Core
-- ✅ Bot connection and handler registration
-- ✅ Command routing system
-- ✅ Message parsing and formatting
-- ✅ Inline keyboard support
-- ✅ Error handling middleware
-
-#### TODO-5: Claude Code Integration
-- ✅ Subprocess management for Claude CLI
-- ✅ Response streaming and parsing
-- ✅ Session state persistence
-- ✅ Timeout handling
-- ✅ Tool usage monitoring
-
-#### TODO-6: Storage Layer
-- ✅ SQLite database schema
-- ✅ Repository pattern implementation
-- ✅ Migration system
-- ✅ Analytics and reporting
-
 ### Documentation Improvements
 
 - API documentation
@@ -197,6 +170,14 @@ async def test_feature():
 - End-to-end tests
 - Performance tests
 - Security tests
+
+### Runtime Improvements
+
+- Telegram delivery resilience
+- Topic session durability
+- Local-only voice transcription
+- Webhook authentication and replay protection
+- MCP tool coverage
 
 ## Submitting Changes
 
@@ -322,9 +303,11 @@ Any other context about the feature request.
 **Do not** create public issues for security vulnerabilities.
 
 Instead:
-1. Email security concerns to [maintainer email]
-2. Include detailed description of the vulnerability
-3. Wait for acknowledgment before public disclosure
+1. Use GitHub private vulnerability reporting:
+   https://github.com/ftaricano/telegram-claude-code-bridge/security/advisories/new
+2. Include a detailed description, steps to reproduce, impact, and suggested
+   mitigation.
+3. Wait for maintainer acknowledgment before public disclosure.
 
 ### Security Guidelines
 
@@ -405,4 +388,4 @@ Contributors will be recognized in:
 - Project documentation
 - Release notes
 
-Thank you for contributing to Telegram Claude Code Bridge! 🚀
+Thank you for contributing to Telegram Claude Code Bridge.

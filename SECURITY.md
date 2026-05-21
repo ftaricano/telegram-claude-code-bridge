@@ -2,9 +2,9 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.1.x   | Current development |
+| Version | Supported |
+| ------- | --------- |
+| 1.6.x   | Current development |
 
 ## Security Model
 
@@ -70,14 +70,14 @@ ALLOWED_USERS=123456789,987654321  # Telegram user IDs
 
 # Optional: Token-based authentication
 ENABLE_TOKEN_AUTH=true
-AUTH_TOKEN_SECRET=your-secret-here  # Generate with: openssl rand -hex 32
+AUTH_TOKEN_SECRET=<AUTH_TOKEN_SECRET>  # Generate with: openssl rand -hex 32
 ```
 
 ### Webhook Security Settings
 
 ```bash
 # GitHub webhook signature verification
-GITHUB_WEBHOOK_SECRET=your-github-webhook-secret
+GITHUB_WEBHOOK_SECRET=<GITHUB_WEBHOOK_SECRET>
 
 # Generic webhook Bearer token
 WEBHOOK_API_SECRET=<WEBHOOK_API_SECRET>
@@ -176,7 +176,8 @@ ENVIRONMENT=production  # Enables strict security defaults
 
 **Do not create public GitHub issues for security vulnerabilities.**
 
-For security issues, please email: [Insert security contact email]
+For security issues, use GitHub private vulnerability reporting:
+https://github.com/ftaricano/telegram-claude-code-bridge/security/advisories/new
 
 Include: description, steps to reproduce, potential impact, and suggested mitigation.
 
