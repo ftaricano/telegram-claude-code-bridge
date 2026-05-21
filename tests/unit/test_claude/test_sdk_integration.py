@@ -112,7 +112,7 @@ class TestClaudeSDKManager:
         self, config, monkeypatch
     ):
         """SDK manager must ignore and remove Anthropic API key environment auth."""
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-" + "unsupported")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "unsupported-anthropic-api-key")
 
         ClaudeSDKManager(config)
 

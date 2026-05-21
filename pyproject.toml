@@ -31,9 +31,8 @@ dependencies = [
     "python-dotenv>=1.0.0,<2",
     "aiofiles>=24.1.0,<25",
     "aiosqlite>=0.21.0,<0.22",
-    "anthropic>=0.40.0,<0.41",
     "claude-agent-sdk>=0.1.39,<0.2",
-    "fastapi>=0.115.0,<0.116",
+    "fastapi>=0.124.0,<1",
     "uvicorn[standard]>=0.34.0,<0.35",
     "apscheduler>=3.10,<4",
     "PyYAML>=6.0.2,<7",
@@ -68,11 +67,11 @@ include = ["src", "README.md", "LICENSE", "NOTICE", "pyproject.toml"]
 
 [dependency-groups]
 dev = [
-    "pytest>=8.4.0,<9",
+    "pytest>=9.0.3,<10",
     "pytest-asyncio>=1.0.0,<2",
     "pytest-cov>=6.1.1,<7",
     "pytest-mock>=3.14.1,<4",
-    "black>=25.1.0,<26",
+    "black>=26.3.1,<27",
     "isort>=6.0.1,<7",
     "flake8>=7.2.0,<8",
     "mypy>=1.16.0,<2",

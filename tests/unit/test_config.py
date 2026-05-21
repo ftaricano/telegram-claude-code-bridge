@@ -49,7 +49,7 @@ def test_settings_with_valid_data(tmp_path):
 
 def test_settings_does_not_model_anthropic_api_key(tmp_path, monkeypatch):
     """ANTHROPIC_API_KEY is not a supported app setting."""
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-" + "unsupported")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "unsupported-anthropic-api-key")
 
     settings = Settings(
         telegram_bot_token="test_token",

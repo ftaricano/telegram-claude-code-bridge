@@ -43,7 +43,7 @@ ALLOWED_USERS=123456789,987654321
 
 # Enable token-based authentication (requires AUTH_TOKEN_SECRET)
 ENABLE_TOKEN_AUTH=false
-AUTH_TOKEN_SECRET=your-secret-key-here
+AUTH_TOKEN_SECRET=<AUTH_TOKEN_SECRET>
 ```
 
 #### Security Relaxation (Trusted Environments Only)
@@ -155,8 +155,8 @@ ENABLE_API_SERVER=false               # Enable FastAPI webhook server
 API_SERVER_PORT=8080                  # Server port (default: 8080)
 
 # Webhook Authentication
-GITHUB_WEBHOOK_SECRET=your-secret    # GitHub HMAC-SHA256 secret
-WEBHOOK_API_SECRET=your-secret       # Bearer token for generic providers
+GITHUB_WEBHOOK_SECRET=<GITHUB_WEBHOOK_SECRET>  # GitHub HMAC-SHA256 secret
+WEBHOOK_API_SECRET=<WEBHOOK_API_SECRET>        # Bearer token for generic providers
 
 # Job Scheduler
 ENABLE_SCHEDULER=false                # Enable cron job scheduler
