@@ -1,0 +1,10 @@
+projects:
+  - slug: tapagent-telegram
+    name: TapAgent for Telegram
+    path: .
+    enabled: true
+
+  - slug: docs
+    name: Documentation
+    path: docs
+    enabled: true
